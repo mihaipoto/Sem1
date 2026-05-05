@@ -1,0 +1,136 @@
+public sealed class ChannelDualModeSemaphore
+{
+    private readonly object _lock = new();
+
+    private Mode _current = Mode.None;
+    private int _count = 0;
+
+    private readonly Channel<Waiter> _queue =
+        Channel.CreateUnbounded<Waiter>();
+
+    private Task _transitionTask = Task.CompletedTask;
+    private Mode _lastMode = Mode.None;
+
+    private readonly Func<Mode, Mode, Task>? _onTransition;
+
+    public ChannelDualModeSemaphore(Func<Mode, Mode, Task>? onTransition = null)
+    {
+        _onTransition = onTransition;
+    }
+
+    private sealed class Waiter
+    {
+        public Mode Mode;
+        public TaskCompletionSource<bool> Tcs =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    public async ValueTask EnterAsync(Mode requested)
+    {
+        Task waitTransition;
+
+        lock (_lock)
+        {
+            if (_current == Mode.None || _current == requested)
+            {
+                _current = requested;
+                _count++;
+                return;
+            }
+
+            waitTransition = _transitionTask;
+        }
+
+        await waitTransition.ConfigureAwait(false);
+
+        var waiter = new Waiter { Mode = requested };
+
+        await _queue.Writer.WriteAsync(waiter);
+        await waiter.Tcs.Task;
+    }
+
+    public async ValueTask ExitAsync()
+    {
+        bool shouldTransition = false;
+        Mode fromMode = Mode.None;
+
+        lock (_lock)
+        {
+            _count--;
+
+            if (_count == 0)
+            {
+                fromMode = _current;
+                _current = Mode.None;
+                _lastMode = fromMode;
+
+                shouldTransition = true;
+            }
+        }
+
+        if (shouldTransition)
+        {
+            await RunTransitionAndDrain(fromMode);
+        }
+    }
+
+    private async Task RunTransitionAndDrain(Mode fromMode)
+    {
+        Mode nextMode = PeekNextMode();
+
+        Task transitionTask = Task.CompletedTask;
+
+        if (_onTransition != null && nextMode != Mode.None)
+        {
+            transitionTask = _onTransition(fromMode, nextMode);
+        }
+
+        lock (_lock)
+        {
+            _transitionTask = transitionTask;
+        }
+
+        await transitionTask.ConfigureAwait(false);
+
+        DrainAllSameMode();
+    }
+
+    private Mode PeekNextMode()
+    {
+        if (_queue.Reader.TryPeek(out var waiter))
+            return waiter.Mode;
+
+        return Mode.None;
+    }
+
+    private void DrainAllSameMode()
+    {
+        var temp = new List<Waiter>();
+
+        while (_queue.Reader.TryRead(out var w))
+            temp.Add(w);
+
+        if (temp.Count == 0)
+            return;
+
+        var mode = temp[0].Mode;
+
+        foreach (var waiter in temp)
+        {
+            if (waiter.Mode == mode)
+            {
+                lock (_lock)
+                {
+                    _current = mode;
+                    _count++;
+                }
+
+                waiter.Tcs.SetResult(true);
+            }
+            else
+            {
+                _queue.Writer.TryWrite(waiter);
+            }
+        }
+    }
+}
