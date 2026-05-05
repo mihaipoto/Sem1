@@ -1,0 +1,196 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+
+namespace DualModeSemaphoreDemo
+{
+    public enum Mode
+    {
+        None = 0,
+        A,
+        B
+    }
+
+    public sealed class ChannelDualModeSemaphore
+    {
+        private readonly object _lock = new();
+
+        private Mode _current = Mode.None;
+        private int _count = 0;
+
+        private readonly Channel<Waiter> _queue =
+            Channel.CreateUnbounded<Waiter>();
+
+        // Debug queue (for visualization only)
+        private readonly List<Mode> _debugQueue = new();
+
+        private sealed class Waiter
+        {
+            public Mode Mode;
+            public TaskCompletionSource<bool> Tcs =
+                new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        public async ValueTask EnterAsync(Mode requested)
+        {
+            lock (_lock)
+            {
+                if (_current == Mode.None || _current == requested)
+                {
+                    _current = requested;
+                    _count++;
+                    PrintState($"ENTER {requested}");
+                    return;
+                }
+            }
+
+            var waiter = new Waiter { Mode = requested };
+
+            lock (_lock)
+            {
+                _debugQueue.Add(requested);
+                PrintState($"QUEUE {requested}");
+            }
+
+            await _queue.Writer.WriteAsync(waiter);
+            await waiter.Tcs.Task;
+
+            lock (_lock)
+            {
+                // remove from debug queue when granted
+                var idx = _debugQueue.IndexOf(requested);
+                if (idx >= 0) _debugQueue.RemoveAt(idx);
+
+                PrintState($"GRANTED {requested}");
+            }
+        }
+
+        public ValueTask ExitAsync()
+        {
+            bool shouldDrain = false;
+
+            lock (_lock)
+            {
+                _count--;
+
+                if (_count == 0)
+                {
+                    _current = Mode.None;
+                    shouldDrain = true;
+                    PrintState("STATE -> NONE");
+                }
+                else
+                {
+                    PrintState("EXIT");
+                }
+            }
+
+            if (shouldDrain)
+                DrainAllSameMode();
+
+            return ValueTask.CompletedTask;
+        }
+
+        private void DrainAllSameMode()
+        {
+            var temp = new List<Waiter>();
+
+            while (_queue.Reader.TryRead(out var w))
+                temp.Add(w);
+
+            if (temp.Count == 0)
+            {
+                lock (_lock)
+                    PrintState("QUEUE EMPTY");
+                return;
+            }
+
+            var mode = temp[0].Mode;
+
+            foreach (var waiter in temp)
+            {
+                if (waiter.Mode == mode)
+                {
+                    lock (_lock)
+                    {
+                        _current = mode;
+                        _count++;
+                        PrintState($"DRAIN {mode}");
+                    }
+
+                    waiter.Tcs.SetResult(true);
+                }
+                else
+                {
+                    _queue.Writer.TryWrite(waiter);
+                }
+            }
+        }
+
+        private void PrintState(string action)
+        {
+            var queue = _debugQueue.Count == 0
+                ? "-"
+                : string.Join(" ", _debugQueue.Select(x => x.ToString()));
+
+            Console.WriteLine(
+                $"{DateTime.Now:HH:mm:ss.fff} | " +
+                $"{action,-12} | " +
+                $"STATE={_current,-4} COUNT={_count,-2} " +
+                $"QUEUE=[ {queue} ]");
+        }
+    }
+
+    class Program
+    {
+        static async Task Worker(int id, ChannelDualModeSemaphore sem, Random rnd)
+        {
+            while (true)
+            {
+                // Phase A
+                await Task.Delay(rnd.Next(200, 800));
+                Console.WriteLine($"T{id} requesting A");
+
+                await sem.EnterAsync(Mode.A);
+                Console.WriteLine($">>> T{id} ENTER A");
+
+                await Task.Delay(rnd.Next(500, 1500)); // arbitrary work
+
+                await sem.ExitAsync();
+                Console.WriteLine($"<<< T{id} EXIT  A");
+
+                // Phase B (same function, re-request different mode)
+                await Task.Delay(rnd.Next(200, 800));
+                Console.WriteLine($"T{id} requesting B");
+
+                await sem.EnterAsync(Mode.B);
+                Console.WriteLine($">>> T{id} ENTER B");
+
+                await Task.Delay(rnd.Next(500, 1500)); // arbitrary work
+
+                await sem.ExitAsync();
+                Console.WriteLine($"<<< T{id} EXIT  B");
+            }
+        }
+
+        static async Task Main()
+        {
+            var sem = new ChannelDualModeSemaphore();
+
+            var tasks = new List<Task>();
+
+            for (int i = 1; i <= 5; i++)
+            {
+                int id = i;
+                tasks.Add(Task.Run(() =>
+                    Worker(id, sem, new Random(id))));
+            }
+
+            Console.WriteLine("Running... Ctrl+C to stop\n");
+
+            await Task.WhenAll(tasks);
+        }
+    }
+}
