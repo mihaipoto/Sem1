@@ -1,0 +1,72 @@
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using WinDivertSharp;
+
+public class Worker : BackgroundService
+{
+    private readonly ILogger<Worker> _logger;
+    private WinDivert _divert;
+
+    public Worker(ILogger<Worker> logger)
+    {
+        _logger = logger;
+    }
+
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Starting ARP Blocker Service...");
+
+        string filter = "ether proto 0x0806"; // ARP
+
+        _divert = new WinDivert(filter, WinDivertLayer.Network, 0, 0);
+        _divert.Open();
+
+        _logger.LogInformation("WinDivert opened. Blocking ARP.");
+
+        return base.StartAsync(cancellationToken);
+    }
+
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        return Task.Run(() =>
+        {
+            byte[] packet = new byte[65535];
+            WinDivertAddress addr = new WinDivertAddress();
+            long counter = 0;
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    int len = _divert.Recv(packet, ref addr);
+
+                    counter++;
+
+                    if (counter % 500 == 0)
+                    {
+                        _logger.LogInformation($"Blocked ARP packets: {counter}");
+                    }
+
+                    // Drop packet (do nothing)
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error while processing packet");
+                }
+            }
+
+        }, stoppingToken);
+    }
+
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Stopping ARP Blocker Service...");
+
+        _divert?.Dispose();
+
+        return base.StopAsync(cancellationToken);
+    }
+}
